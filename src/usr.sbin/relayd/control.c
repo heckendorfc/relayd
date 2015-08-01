@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.46 2014/07/11 16:39:10 krw Exp $	*/
+/*	$OpenBSD: control.c,v 1.49 2015/05/28 17:08:09 florian Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -17,12 +17,10 @@
  */
 
 #include <sys/queue.h>
-#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
-
-#include <net/if.h>
 
 #include <errno.h>
 #include <event.h>
@@ -30,9 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
@@ -130,7 +126,6 @@ control_cleanup(struct control_sock *cs)
 		return;
 	event_del(&cs->cs_ev);
 	event_del(&cs->cs_evt);
-	(void)unlink(cs->cs_name);
 }
 
 /* ARGSUSED */

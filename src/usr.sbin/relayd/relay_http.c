@@ -1,7 +1,7 @@
-/*	$OpenBSD: relay_http.c,v 1.32 2014/07/17 11:35:26 stsp Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.52 2015/07/28 10:24:26 reyk Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -19,31 +19,25 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/tree.h>
-#include <sys/hash.h>
 
-#include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include <limits.h>
 #include <stdio.h>
-#include <err.h>
-#include <pwd.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <time.h>
 #include <event.h>
 #include <fnmatch.h>
-
-#include <openssl/ssl.h>
+#include <siphash.h>
+#include <imsg.h>
+#if DEBUG > 1
+#include <unistd.h>
+#endif
 
 #include "relayd.h"
 #include "http.h"
@@ -155,6 +149,7 @@ relay_httpdesc_free(struct http_descriptor *desc)
 		desc->query_val = NULL;
 	}
 	kv_purge(&desc->http_headers);
+	desc->http_lastheader = NULL;
 }
 
 void
@@ -219,7 +214,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		else
 			value = strchr(key, ':');
 		if (value == NULL) {
-			if (cre->line == 1) {
+			if (cre->line <= 2) {
 				free(line);
 				relay_abort_http(con, 400, "malformed", 0);
 				return;
@@ -280,8 +275,10 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			goto lookup;
 		} else if (cre->line == 1 && cre->dir == RELAY_DIR_REQUEST) {
 			if ((desc->http_method = relay_httpmethod_byname(key))
-			    == HTTP_METHOD_NONE)
+			    == HTTP_METHOD_NONE) {
+				free(line);
 				goto fail;
+			}
 			/*
 			 * Decode request path and query
 			 */
@@ -291,18 +288,20 @@ relay_read_http(struct bufferevent *bev, void *arg)
 				goto fail;
 			}
 			desc->http_version = strchr(desc->http_path, ' ');
-			if (desc->http_version != NULL)
-				*desc->http_version++ = '\0';
+			if (desc->http_version == NULL) {
+				free(line);
+				goto fail;
+			}
+			*desc->http_version++ = '\0';
 			desc->http_query = strchr(desc->http_path, '?');
 			if (desc->http_query != NULL)
 				*desc->http_query++ = '\0';
 
 			/*
 			 * Have to allocate the strings because they could
-			 * be changed independetly by the filters later.
+			 * be changed independently by the filters later.
 			 */
-			if (desc->http_version != NULL &&
-			    (desc->http_version =
+			if ((desc->http_version =
 			    strdup(desc->http_version)) == NULL) {
 				free(line);
 				goto fail;
@@ -422,25 +421,33 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		relay_reset_http(cre);
  done:
 		if (cre->dir == RELAY_DIR_REQUEST && cre->toread <= 0 &&
-		    cre->dst->bev == NULL) {
+		    cre->dst->state != STATE_CONNECTED) {
 			if (rlay->rl_conf.fwdmode == FWD_TRANS) {
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
 				return;
 			}
-			if (relay_connect(con) == -1)
+			if (relay_connect(con) == -1) {
 				relay_abort_http(con, 502, "session failed", 0);
-			return;
+				return;
+			}
 		}
 	}
 	if (con->se_done) {
 		relay_close(con, "last http read (done)");
 		return;
 	}
+	switch (relay_splice(cre)) {
+	case -1:
+		relay_close(con, strerror(errno));
+	case 1:
+		return;
+	case 0:
+		break;
+	}
+	bufferevent_enable(bev, EV_READ);
 	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
-	if (relay_splice(cre) == -1)
-		relay_close(con, strerror(errno));
+	/* The callback readcb() might have freed the session. */
 	return;
  fail:
 	relay_abort_http(con, 500, strerror(errno), 0);
@@ -454,6 +461,8 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
+	struct protocol		*proto = con->se_relay->rl_proto;
+
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	size_t			 size;
 
@@ -490,9 +499,15 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	}
 	if (con->se_done)
 		goto done;
+	bufferevent_enable(bev, EV_READ);
+
+	if (cre->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(cre->dst->bev)) >
+	    (size_t)RELAY_MAX_PREFETCH * proto->tcpbufsiz)
+		bufferevent_disable(cre->bev, EV_READ);
+
 	if (bev->readcb != relay_read_httpcontent)
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
+	/* The callback readcb() might have freed the session. */
 	return;
  done:
 	relay_close(con, "last http content read");
@@ -506,6 +521,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
+	struct protocol		*proto = con->se_relay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line;
 	long long		 llval;
@@ -607,9 +623,15 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
  next:
 	if (con->se_done)
 		goto done;
+	bufferevent_enable(bev, EV_READ);
+
+	if (cre->dst->bev && EVBUFFER_LENGTH(EVBUFFER_OUTPUT(cre->dst->bev)) >
+	    (size_t)RELAY_MAX_PREFETCH * proto->tcpbufsiz)
+		bufferevent_disable(cre->bev, EV_READ);
+
 	if (EVBUFFER_LENGTH(src))
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
+	/* The callback readcb() might have freed the session. */
 	return;
 
  done:
@@ -693,7 +715,7 @@ relay_lookup_url(struct ctl_relay_event *cre, const char *host, struct kv *kv)
 	struct http_descriptor	*desc = (struct http_descriptor *)cre->desc;
 	int			 i, j, dots;
 	char			*hi[RELAY_MAXLOOKUPLEVELS], *p, *pp, *c, ch;
-	char			 ph[MAXHOSTNAMELEN];
+	char			 ph[HOST_NAME_MAX+1];
 	int			 ret;
 
 	if (desc->http_path == NULL)
@@ -871,6 +893,17 @@ relay_lookup_query(struct ctl_relay_event *cre, struct kv *kv)
 	return (ret);
 }
 
+ssize_t
+relay_http_time(time_t t, char *tmbuf, size_t len)
+{
+	struct tm		 tm;
+
+	/* New HTTP/1.1 RFC 7231 prefers IMF-fixdate from RFC 5322 */
+	if (t == -1 || gmtime_r(&t, &tm) == NULL)
+		return (-1);
+	else
+		return (strftime(tmbuf, len, "%a, %d %h %Y %T %Z", &tm));
+}
 
 void
 relay_abort_http(struct rsession *con, u_int code, const char *msg,
@@ -879,11 +912,10 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	struct relay		*rlay = con->se_relay;
 	struct bufferevent	*bev = con->se_in.bev;
 	const char		*httperr = NULL, *text = "";
-	char			*httpmsg;
-	time_t			 t;
-	struct tm		*lt;
+	char			*httpmsg, *body = NULL;
 	char			 tmbuf[32], hbuf[128];
 	const char		*style, *label = NULL;
+	int			 bodylen;
 
 	if ((httperr = relay_httperror_byid(code)) == NULL)
 		httperr = "Unknown Error";
@@ -905,31 +937,27 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	if (print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
 		goto done;
 
-	/* RFC 2616 "tolerates" asctime() */
-	time(&t);
-	lt = localtime(&t);
-	tmbuf[0] = '\0';
-	if (asctime_r(lt, tmbuf) != NULL)
-		tmbuf[strlen(tmbuf) - 1] = '\0';	/* skip final '\n' */
+	if (relay_http_time(time(NULL), tmbuf, sizeof(tmbuf)) <= 0)
+		goto done;
 
 	/* Do not send details of the Internal Server Error */
-	if (code != 500)
+	switch (code) {
+	case 500:
+		break;
+	default:
 		text = msg;
+		break;
+	}
 
 	/* A CSS stylesheet allows minimal customization by the user */
-	if ((style = rlay->rl_proto->style) == NULL)
-		style = "body { background-color: #a00000; color: white; }";
+	style = (rlay->rl_proto->style != NULL) ? rlay->rl_proto->style :
+	    "body { background-color: #a00000; color: white; font-family: "
+	    "'Comic Sans MS', 'Chalkboard SE', 'Comic Neue', sans-serif; }\n"
+	    "hr { border: 0; border-bottom: 1px dashed; }\n";
 
 	/* Generate simple HTTP+HTML error document */
-	if (asprintf(&httpmsg,
-	    "HTTP/1.0 %03d %s\r\n"
-	    "Date: %s\r\n"
-	    "Server: %s\r\n"
-	    "Connection: close\r\n"
-	    "Content-Type: text/html\r\n"
-	    "\r\n"
-	    "<!DOCTYPE HTML PUBLIC "
-	    "\"-//W3C//DTD HTML 4.01 Transitional//EN\">\n"
+	if ((bodylen = asprintf(&body,
+	    "<!DOCTYPE html>\n"
 	    "<html>\n"
 	    "<head>\n"
 	    "<title>%03d %s</title>\n"
@@ -942,10 +970,22 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	    "<hr><address>%s at %s port %d</address>\n"
 	    "</body>\n"
 	    "</html>\n",
-	    code, httperr, tmbuf, RELAYD_SERVERNAME,
 	    code, httperr, style, httperr, text,
 	    label == NULL ? "" : label,
-	    RELAYD_SERVERNAME, hbuf, ntohs(rlay->rl_conf.port)) == -1)
+	    RELAYD_SERVERNAME, hbuf, ntohs(rlay->rl_conf.port))) == -1)
+		goto done;
+
+	/* Generate simple HTTP+HTML error document */
+	if (asprintf(&httpmsg,
+	    "HTTP/1.0 %03d %s\r\n"
+	    "Date: %s\r\n"
+	    "Server: %s\r\n"
+	    "Connection: close\r\n"
+	    "Content-Type: text/html\r\n"
+	    "Content-Length: %d\r\n"
+	    "\r\n"
+	    "%s",
+	    code, httperr, tmbuf, RELAYD_SERVERNAME, bodylen, body) == -1)
 		goto done;
 
 	/* Dump the message without checking for success */
@@ -953,6 +993,7 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 	free(httpmsg);
 
  done:
+	free(body);
 	if (asprintf(&httpmsg, "%s (%03d %s)", msg, code, httperr) == -1)
 		relay_close(con, msg);
 	else {
@@ -1233,7 +1274,8 @@ relay_httpheader_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 		/* Fail if header doesn't exist */
 		return (-1);
 	} else {
-		if (fnmatch(kv->kv_key, match->kv_key, FNM_CASEFOLD) == FNM_NOMATCH)
+		if (fnmatch(kv->kv_key, match->kv_key,
+		    FNM_CASEFOLD) == FNM_NOMATCH)
 			return (-1);
 		if (kv->kv_value != NULL &&
 		    match->kv_value != NULL &&
@@ -1307,7 +1349,7 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
     struct kvlist *actions)
 {
 	struct http_descriptor	*desc = cre->desc;
-	struct kv               *kv = &rule->rule_kv[KEY_TYPE_COOKIE], key;
+	struct kv		*kv = &rule->rule_kv[KEY_TYPE_COOKIE], key;
 	struct kv		*match = NULL;
 
 	if (kv->kv_type != KEY_TYPE_COOKIE)
@@ -1349,7 +1391,7 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
     struct kvlist *matches, struct kvlist *actions)
 {
 	struct rsession		*con = cre->con;
-	struct kv		*kv;
+	struct kv		*kv, *tmp;
 
 	/*
 	 * Apply the following options instantly (action per match).
@@ -1368,7 +1410,7 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 	 */
 	if (matches == NULL) {
 		/* 'pass' or 'block' rule */
-		TAILQ_FOREACH(kv, &rule->rule_kvlist, kv_rule_entry) {
+		TAILQ_FOREACH_SAFE(kv, &rule->rule_kvlist, kv_rule_entry, tmp) {
 			TAILQ_INSERT_TAIL(actions, kv, kv_action_entry);
 			TAILQ_REMOVE(&rule->rule_kvlist, kv, kv_rule_entry);
 		}
@@ -1485,12 +1527,8 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 				value = match->kv_value;
 				break;
 			}
-			if (!con->se_hashkeyset)
-				con->se_hashkey = HASHINIT;
-			con->se_hashkey = hash32_str(value, con->se_hashkey);
-			con->se_hashkeyset = 1;
-			log_debug("%s: hashkey 0x%04x", __func__,
-			    con->se_hashkey);
+			SipHash24_Update(&con->se_siphashctx,
+			    value, strlen(value));
 			break;
 		case KEY_OPTION_LOG:
 			/* perform this later */
@@ -1522,7 +1560,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 		}
 
  matchdel:
-		switch(kv->kv_option) {
+		switch (kv->kv_option) {
 		case KEY_OPTION_LOG:
 			if (match == NULL)
 				break;
@@ -1531,10 +1569,10 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 				goto fail;
 			if (mp->kv_flags & KV_FLAG_INVALID) {
 				if (kv_set(mp, "%s (removed)",
-				   mp->kv_value) == -1)
+				    mp->kv_value) == -1)
 					goto fail;
 			}
-			switch(kv->kv_type) {
+			switch (kv->kv_type) {
 			case KEY_TYPE_URL:
 				key.kv_key = "Host";
 				host = kv_find(&desc->http_headers, &key);
