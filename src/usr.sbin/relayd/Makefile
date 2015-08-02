@@ -42,13 +42,17 @@ SRCS+=	buffer.c \
 	select.c \
 	signal.c
 
+.PATH:	${.CURDIR}/../../../siphash
+SRCS+=	siphash.c
+
 CFLAGS+=	-DSHA1_DIGEST_LENGTH=SHA_DIGEST_LENGTH \
 		-DSHA1_DIGEST_STRING_LENGTH=SHA_DIGEST_LENGTH \
 		-DOPENSSL_NO_SHA -DOPENSSL_NO_MD5 \
 		-D__dead='' \
 		-DHAVE_CONFIG_H
 CFLAGS+=	-I${.CURDIR} -I${.CURDIR}/../../lib/libutil \
-		-I${.CURDIR}/../../../libevent
+		-I${.CURDIR}/../../../libevent\
+		-I${.CURDIR}/../../../siphash
 CLEANFILES+=	y.tab.h
 
 LDADD=		-lmd -L${PREFIX}/lib ${LIBEVENT} -lssl -lcrypto

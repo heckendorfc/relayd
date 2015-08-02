@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tcp.c,v 1.43 2014/05/15 07:56:26 reyk Exp $	*/
+/*	$OpenBSD: check_tcp.c,v 1.46 2015/01/22 17:42:09 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -18,9 +18,10 @@
 
 #include <sys/param.h>
 #include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
 
 #include <limits.h>
@@ -33,7 +34,7 @@
 #include <fnmatch.h>
 #include <sha.h>
 
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
@@ -156,7 +157,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 {
 	switch (cte->table->conf.check) {
 	case CHECK_TCP:
-		if (cte->table->conf.flags & F_SSL)
+		if (cte->table->conf.flags & F_TLS)
 			break;
 		tcp_close(cte, 0);
 		hce_notify_done(cte->host, HCE_TCP_CONNECT_OK);
@@ -175,7 +176,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 		break;
 	}
 
-	if (cte->table->conf.flags & F_SSL) {
+	if (cte->table->conf.flags & F_TLS) {
 		ssl_transaction(cte);
 		return;
 	}

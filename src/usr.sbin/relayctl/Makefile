@@ -20,6 +20,7 @@ CFLAGS+=	-D__dead='' \
 CFLAGS+=	-I${.CURDIR} \
 		-I${.CURDIR}/../../lib/libutil \
 		-I${.CURDIR}/../relayd \
-		-I${.CURDIR}/../../../libevent
+		-I${.CURDIR}/../../../libevent \
+		-I${.CURDIR}/../../../siphash
 
 .include <bsd.prog.mk>
